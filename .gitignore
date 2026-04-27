@@ -3,6 +3,8 @@ vendor/bundle/
 Gemfile.lock
 .env
 .env.*
+id_rsa
+ci.env
 *.log
 
 # dry-stack generated configs

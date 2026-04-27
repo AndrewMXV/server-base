@@ -47,6 +47,18 @@ ruby bin/deploy-menu
 The deploy CLI loads `config/servers/demo.rb`, resolves action dependencies,
 runs remote checks, and applies only the actions that are not already satisfied.
 
+## CI/CD
+
+The repository includes a GitLab CI deploy pipeline. Configure `SSH_PRIVATE_KEY`
+as a masked CI variable, then run either the default deploy job or the manual
+`deploy-demo` job.
+
+Local Docker smoke test:
+
+```sh
+./test-deploy-dockerfile.sh config/servers demo
+```
+
 ## Useful Environment Variables
 
 - `GF_ADMIN_PASSWORD`: Grafana admin password. Defaults to `admin`.

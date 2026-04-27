@@ -1,0 +1,25 @@
+FROM ruby:3.3.0-alpine3.19 AS base
+
+RUN apk add --no-cache bash ca-certificates curl docker-cli-buildx git jq openssh-client parallel rsync
+
+WORKDIR /build
+COPY Gemfile ./
+RUN bundle install
+
+RUN mkdir -p /root/.ssh/sockets \
+  && printf '%s\n' \
+    'Host *' \
+    '  ControlPersist yes' \
+    '  ControlMaster auto' \
+    '  ControlPath /root/.ssh/sockets/%r@%h-%p' \
+    '  BatchMode yes' \
+    '  StrictHostKeyChecking no' \
+    '  Port 22' \
+    '  IdentityFile /root/.ssh/id_rsa' \
+    > /root/.ssh/config \
+  && chmod 700 /root/.ssh \
+  && chmod 600 /root/.ssh/config
+
+ADD . .
+
+ENTRYPOINT ["./run-all.rb"]

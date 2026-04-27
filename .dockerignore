@@ -1,0 +1,10 @@
+.git
+.bundle
+vendor/bundle
+Gemfile.lock
+.env
+.env.*
+id_rsa
+ci.env
+parallel.log
+*.config.*

@@ -1,0 +1,33 @@
+stages:
+  - deploy
+  # AUTO-GENERATED DEPLOY STAGES START
+  - deploy-servers
+  # AUTO-GENERATED DEPLOY STAGES END
+
+.deploy_template:
+  stage: deploy
+  tags: [swarm]
+  image: docker:26.0.2
+  script:
+    - test -n "${SSH_PRIVATE_KEY}"
+    - printf '%s\n' "${SSH_PRIVATE_KEY}" > id_rsa
+    - chmod 600 id_rsa
+    - env | grep -E '^(CI_|DEBUG=|JOBS=|JOB_TIMEOUT=)' > ci.env
+    - docker build -t "deploy/${CI_PROJECT_NAME}" -f Dockerfile.deploy .
+    - docker run --rm --env-file ci.env -v /var/run/docker.sock:/var/run/docker.sock -v "${PWD}/id_rsa:/root/.ssh/id_rsa:ro" -v /run/ssh-agent:/run/ssh-agent:ro "deploy/${CI_PROJECT_NAME}" ${DEPLOY_ARGS}
+
+deploy:
+  extends: .deploy_template
+  variables:
+    DEPLOY_ARGS: ""
+
+# AUTO-GENERATED DEPLOY JOBS START
+# config/servers
+
+deploy-demo:
+  stage: deploy-servers
+  extends: .deploy_template
+  when: manual
+  variables:
+    DEPLOY_ARGS: "config/servers demo"
+# AUTO-GENERATED DEPLOY JOBS END
