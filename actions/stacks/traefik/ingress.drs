@@ -1,0 +1,202 @@
+Description "Ingress"
+
+Labels 'stack.product': 'simple-ingress'
+
+Deploy traefik: { placement: { constraints: ['node.role == manager'] } }
+
+Options name: 'simple-ingress', traefik: true, traefik_tls: !!ENV['TLS_DOMAIN'], tls_domain: ENV['TLS_DOMAIN']
+
+basic_auth = ENV.fetch('TRAEFIK_BASIC_AUTH', 'admin:admin:demo')
+
+Ingress traefik: [
+                  { path: '/traefik', port: '8080', basic_auth: basic_auth },
+                  { host: 'traefik.*', port: '8080', basic_auth: basic_auth }
+                 ]
+
+http_port = ENV.fetch('TRAEFIK_HTTP_PORT', 80)
+https_port = ENV.fetch('TRAEFIK_HTTPS_PORT', 443)
+postgres_port = ENV.fetch('TRAEFIK_POSTGRES_PORT', 5432)
+
+if !!ENV['TLS_DOMAIN']
+  PublishPorts traefik: [ "#{http_port}:80", "#{https_port}:443", "#{https_port}:443/udp",
+                          "#{postgres_port}:5432" ]
+else
+  PublishPorts traefik: [ { target: 80, published: http_port.to_i, protocol: 'tcp', mode: 'host' } ]
+end
+
+OTLP_COMMAND = %(
+  --metrics.otlp=true
+  --metrics.otlp.addEntryPointsLabels=true
+  --metrics.otlp.addRoutersLabels=true
+  --metrics.otlp.addServicesLabels=true
+  --metrics.otlp.pushInterval=10s
+  --metrics.otlp.http.endpoint=http://otlp_collector:4318/v1/metrics
+  --metrics.otlp.http.tls.insecureSkipVerify=true
+).split
+# --tracing.otlp.http.endpoint=http://otlp_collector:4318/v1/traces
+
+TLS_COMMAND = %(
+  --core.defaultRuleSyntax=v2
+  --providers.swarm.endpoint=unix:///var/run/docker.sock
+  --providers.swarm.network=ingress-routing
+  --entrypoints.postgres.address=:5432
+  --entrypoints.http.address=:80
+  --entrypoints.http.asDefault=true
+  --entrypoints.http.http.redirections.entryPoint.to=https
+  --entrypoints.http.http.redirections.entryPoint.scheme=https
+  --entrypoints.http.http.encodedCharacters.allowEncodedSlash=true
+  --entrypoints.https.address=:443
+  --entrypoints.https.asDefault=true
+  --entrypoints.https.http.tls=true
+  --entrypoints.https.http.tls.certResolver=le
+  --entryPoints.https.http3
+  --entryPoints.https.http3.advertisedport=443
+  --entryPoints.https.transport.respondingTimeouts.readTimeout=300
+  --entryPoints.https.http.encodedCharacters.allowEncodedSlash=true
+  --accesslog
+  --log
+  --api
+  --api.insecure=true
+  --entryPoints.https.forwardedHeaders.insecure
+).split
+
+NON_TLS_COMMAND = %(
+  --core.defaultRuleSyntax=v2
+  --providers.swarm.endpoint=unix:///var/run/docker.sock
+  --providers.swarm.network=ingress-routing
+  --entrypoints.http.address=:80
+  --entrypoints.http.asDefault=true
+  --entryPoints.http.forwardedHeaders.insecure
+  --entryPoints.http.http.encodedCharacters.allowEncodedSlash=true
+
+  --accesslog
+  --log
+  --api
+  --api.insecure=true
+  --api.dashboard=true
+).split
+#  --api.basePath=/traefik TODO: still not supported for v3
+#   https://doc.traefik.io/traefik/v3.0/operations/dashboard
+#   https://community.traefik.io/t/can-t-display-the-traefik-dashboard-by-using-pathprefix/23794
+#   https://github.com/traefik/traefik/issues/5374
+
+COMMAND = !!ENV['TLS_DOMAIN'] ? TLS_COMMAND : NON_TLS_COMMAND
+
+COMMAND += %w(
+  --entrypoints.metrics.address=:9090
+  --metrics.prometheus=true
+  --metrics.prometheus.entryPoint=metrics
+  --metrics.prometheus.addEntryPointsLabels=true
+  --metrics.prometheus.addRoutersLabels=true
+  --metrics.prometheus.addServicesLabels=true
+  --metrics.prometheus.headerlabels.useragent=X-Short-Agent
+  --metrics.prometheus.headerlabels.xforwardedhost=X-Forwarded-Host
+  --metrics.prometheus.headerlabels.xrequestpath=X-Short-Path
+  --entryPoints.http.http.middlewares=add-header@file,default-headers@file
+  --entryPoints.https.http.middlewares=add-header@file,default-headers@file
+  --providers.file.directory=/etc/traefik_dynamic
+  --experimental.localplugins.add_header_plugin.modulename=add_header_plugin
+)
+# --log.level=DEBUG
+
+# --entryPoints.name.transport.lifeCycle.requestAcceptGraceTimeout=42
+# --entryPoints.name.transport.lifeCycle.graceTimeOut=42
+# --entryPoints.name.transport.respondingTimeouts.readTimeout=42
+# --entryPoints.name.transport.respondingTimeouts.writeTimeout=42
+# --entryPoints.name.transport.respondingTimeouts.idleTimeout=42
+#
+if ENV['TRAEFIK_OTLP_ENABLED'] == 'true'
+  COMMAND += OTLP_COMMAND
+end
+
+if ENV['ACME_DNS_API_BASE']
+  COMMAND += [
+    "--certificatesresolvers.le.acme.email=#{ENV.fetch('ACME_EMAIL', 'admin@example.com')}",
+    *%w(
+    --certificatesresolvers.le.acme.storage=/certificates/acme.json
+    --certificatesresolvers.le.acme.dnschallenge=true
+    --certificatesresolvers.le.acme.dnschallenge.provider=acme-dns
+    --certificatesresolvers.le.acme.dnschallenge.delayBeforeCheck=2s
+    --certificatesresolvers.le.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53
+    )
+  ]
+elsif !!ENV['TLS_DOMAIN']
+  COMMAND += [
+    "--certificatesresolvers.le.acme.email=#{ENV.fetch('ACME_EMAIL', 'admin@example.com')}",
+    *%w(
+    --certificatesresolvers.le.acme.storage=/certificates/acme.json
+    --certificatesresolvers.le.acme.tlschallenge=true
+    )
+  ]
+end
+Service :traefik, image: "traefik:#{ENV['TRAEFIK_TAG'] || 'v3.6.4'}" do
+  command COMMAND
+  network :grafana_network
+  volume 'traefik_data:/certificates'
+  volume 'traefik_data:/letsencrypt'
+  volume '/var/run/docker.sock:/var/run/docker.sock'
+
+  config target: '/plugins-local/src/add_header_plugin/.traefik.yml', file: './add_header_plugin/src/.traefik.yml'
+  config target: '/plugins-local/src/add_header_plugin/main.go', file: './add_header_plugin/src/main.go'
+
+  if ENV['ACME_DNS_API_BASE']
+    env ACME_DNS_API_BASE: ENV['ACME_DNS_API_BASE'],
+        ACME_DNS_STORAGE_PATH: '/acme-dns.json'
+
+    # TODO: support wildcard https://community.traefik.io/t/traefik-can-retrieve-a-wildcard-certificate-for-the-primary-domain-but-not-a-subdomain/18002
+    #   - "traefik.http.routers.traefik-secure.tls.domains[0].main=mydomain.com"
+    #   - "traefik.http.routers.traefik-secure.tls.domains[0].sans=*.mydomain.com"
+
+    config target: '/acme-dns.json', file_content: %({ "#{ENV['TLS_DOMAIN']}":#{ENV['ACME_DNS_JSON']} })
+  end
+
+  config target: '/etc/traefik_dynamic/traefik.yml', file_content: <<~'YML'
+    tls:
+      options:
+        default:
+          alpnProtocols:
+             - acme-tls/1
+             - h2
+             - http/1.1
+             - postgresql
+    http:
+      middlewares:
+      #  limit:
+      #    buffering:
+      #      # If the request exceeds the allowed size, it is not forwarded to the Service, and the client gets a 413 (Request Entity Too Large) response.
+      #      maxRequestBodyBytes: 0
+      #      # Threshold (in bytes) from which the request will be buffered on disk instead of in memory with the memRequestBodyBytes option
+      #      memRequestBodyBytes: 1048576
+        default-headers:
+          headers:
+            customRequestHeaders:
+              X-Custom-Request-Header: "test"
+            customResponseHeaders:
+              X-Proxy: traefik
+        add-header:
+          plugin:
+            add_header_plugin:
+              headers:
+                X-Short-Path: Header<Request-Path:.*>Sub<(assets).*:$1>Sub<.*(grafana).*:grafana>Sub<(.*?/fonts/[^/]+)/\d+-\d+\.pbf.*:$1/xyz.pbf>Sub<(.*)/\d+/\d+/\d+.*:$1/xyz>
+                X-Short-Agent: Header<User-Agent:(.*)>Sub<\b([A-Za-z]+)/[A-Za-z0-9.]+\b:$1/X>              
+  YML
+end
+
+if false
+  Deploy :domain_label_sync, { placement: { constraints: ['node.role == manager'] } }
+
+  Service :domain_label_sync, image: 'ruby:3.3' do
+    volume '/var/run/docker.sock:/var/run/docker.sock'
+    config target: '/app/domain_label_sync.rb', file: './scripts/domain_label_sync.rb'
+
+    env DOCKER_SOCKET: '/var/run/docker.sock'
+    env SYNC_INTERVAL: '15'
+    env TARGET_LABEL_KEY: 'traefik.domain_sync'
+    env TARGET_LABEL_VALUE: 'true'
+    env DEFAULT_CERTRESOLVER: 'le'
+    command 'ruby /app/domain_label_sync.rb'
+  end
+end
+
+Volume :traefik_data, name: 'traefik_data'
+Network :grafana_network, external: true , name: 'grafana-network'

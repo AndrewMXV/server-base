@@ -1,0 +1,27 @@
+BeforeService do
+  logging driver: 'loki', options: {
+    'loki-url': 'http://localhost:3100/loki/api/v1/push',
+    'loki-batch-size': 100, 'loki-retries': 2,
+    'loki-max-backoff': '1000ms', 'loki-timeout': '1s',
+    'max-buffer-size': '100m',
+    'mode': 'non-blocking',
+    'max-size': "250m",
+    'max-file': "3",
+    'keep-file': 'true',
+  }
+
+  env OTEL_EXPORTER_OTLP_ENDPOINT: 'http://otlp_collector:4318/',
+      OTEL_EXPORTER_OTLP_ENDPOINT_FRONT: '/otel', # default value '/otel'
+      OTEL_RESOURCE_ATTRIBUTES: 'deployment.environment=%{stack-name},service.name=%{service-name},service.replica={{.Task.Slot}}',
+      OTEL_LOG_LEVEL: 'debug',
+      OTEL_TRACES_EXPORTER:'otlp',
+      REPLICA: "{{.Task.Slot}}"
+
+  network :default
+  network :grafana_network, name: 'grafana-network', external: true
+
+  if ENV['NATS'] == 'true'
+    env NATS_URL: ENV.fetch('NATS_URL', 'nats://nats:nats@nats_single:4222')
+    network :nats_network, name: 'nats-network', external: true
+  end
+end

@@ -1,0 +1,39 @@
+Description <<~DCS
+  Main GIS Map stack
+DCS
+Labels 'stack.product ': 'gis_map'
+
+Options name: 'registry-listener', traefik: true, traefik_tls: !!ENV['TLS_DOMAIN'], tls_domain: ENV['TLS_DOMAIN']
+
+Deploy registry_listener: { placement: { constraints: ['node.role == manager'] } }
+
+Ingress registry_listener: { host: 'listener.*', port: '7000', oauth_provider: 'oauth2_oauth2_slim:7000/auth' }
+
+Service :registry_listener, image: 'dtorry/registry_listener:latest' do
+  network :default
+  network :grafana_network, name: 'grafana-network', external: true
+  deploy_label 'metrics.port=7000'
+
+  volume '/var/run/docker.sock:/var/run/docker.sock'
+  volume '/root/.docker:/root/.docker'
+  config target: '/app/listener_config.rb', file_content: <<-RUBY
+    OnTime minutes: 30 do
+      output = []
+      output << 'Hostname: ' + exec_( "curl -s --unix-socket /var/run/docker.sock http://localhost/info | jq -r '.Name'")
+      output << exec_('docker system prune -f')
+      output << exec_('docker volume prune -f')
+      notify(output.join("\n")) unless output.last =~ /Total\s+reclaimed\s+space:\s+0B/m
+    end
+  RUBY
+
+  env DOCKER_HOSTS: 'unix:///var/run/docker.sock'
+  env UPDATE_PERIOD: '60'
+  env IMAGE_FILTER: '.*'
+
+  # env OTEL_LOG_LEVEL: 'debug'
+  # env OTEL_TRACES_EXPORTER: 'otlp'
+  # env OTEL_EXPORTER_OTLP_ENDPOINT: !!ENV['TLS_DOMAIN'] ? "https://otel.#{ENV['TLS_DOMAIN']}/" : "http://otel.#{ENV['MAIN_DOMAIN']}/"
+
+  env TELEGRAM_BOT_TOKEN: ENV['TELEGRAM_BOT_TOKEN']
+  env TELEGRAM_CHAT_ID: ENV['TELEGRAM_CHAT_ID']
+end

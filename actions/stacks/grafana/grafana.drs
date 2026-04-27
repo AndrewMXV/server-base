@@ -1,0 +1,705 @@
+Description <<~DCS
+  Tempo
+DCS
+Labels 'stack.product': 'tempo'
+
+Options name: 'grafana' , traefik: true, traefik_tls: !!ENV['TLS_DOMAIN'] , tls_domain: ENV['TLS_DOMAIN']
+
+basic_auth = ENV.fetch('GRAFANA_BASIC_AUTH', ENV.fetch('TRAEFIK_BASIC_AUTH', 'admin:admin:demo'))
+
+Ingress grafana: [{ host: 'tempo.*', oauth_provider: 'oauth2_oauth2_slim:7000/auth' },
+                  { path: '/map/grafana', oauth_provider: 'oauth2_oauth2_slim:7000/auth' }
+                 ],
+        otlp_collector: [{ host: 'otel.*' },
+                         { host: '*', path: '/otel', path_sub: ['^/otel(.*)', '$1'] },
+                         { host: '*', path: '/map/otel/v1', path_sub: ['^/map/otel(.*)', '$1'] }, # UP priority  - "traefik.http.routers.Router-2.priority=2"
+                         { host: 'otel.*', path: '/grpc', path_sub: ['^/grpc(.*)', '$1'], port: 4317 },
+                         { host: '*', path: '/otel/grpc', path_sub: ['^/otel\/grpc(.*)', '$1'], port: 4317 }
+        ], # use host: '*' to rise traefik rule priority up
+        cadvisor: { host: 'cadvisor.*', oauth_provider: 'oauth2_oauth2_slim:7000/auth' },
+        victoriametrics: { host: 'victoriametrics.*', oauth_provider: 'oauth2_oauth2_slim:7000/auth' },
+        swarm_timeliner: { host: 'tt.*', oauth_provider: 'oauth2_oauth2_slim:7000/auth' }
+
+
+# get the name of the default network interface:
+# $ ifconfig -s -a
+# $ iptables -I DOCKER-USER -i eth0 -p tcp --destination-port 3100 -j REJECT
+PublishPorts loki: [3100]
+
+Deploy [:loki, :otlp_collector_host, :cadvisor],
+       { 'placement.constraints': ['node.role == manager'] }
+
+Deploy [:node_exporter, :promtail, :fluent_bit2], { mode: 'global' }
+
+Logging [:prometheus, :grafana, :tempo, :cadvisor], driver: 'loki', options: {
+  'loki-url': 'http://localhost:3100/loki/api/v1/push',
+  'loki-batch-size': 100, 'loki-retries': 2, 'loki-max-backoff': '1000ms', 'loki-timeout': '1s', 'max-size': "250m",'max-file': "3" }
+
+Service :tempo, image: "grafana/tempo:#{ENV['TEMPO_TAG'] || '2.8.3'}", ports: 4318 do
+  command '-config.file=/etc/tempo.yaml'
+  network :default
+  network :grafana_network
+  ingress  host: 'tempo.grafana-network.*', basic_auth: basic_auth, port: 3200
+  deploy resources: { 'limits.memory': '3 G' }
+
+  volume target: '/var/tempo', name: 'tempo_data'
+  config :tempo_yaml, target: '/etc/tempo.yaml'
+end
+
+if ENV['GPU_NODE']
+# docker run -d --gpus all --cap-add SYS_ADMIN --rm -p 9400:9400
+# curl localhost:9400/metrics
+Service :dcgm_exporter, image: 'nvidia/dcgm-exporter:4.5.2-4.8.1-distroless', ports: 9400 do
+  cap_add %w[SYS_ADMIN]
+  network :grafana_network
+  network :default
+  env NVIDIA_VISIBLE_DEVICES: "all"
+  env NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+  env DCGM_EXPORTER_COLLECTORS: '/etc/dcgm-exporter/dcp-metrics-included.csv'
+  env DCGM_EXPORTER_DEVICES_STR: 'f'
+end
+end
+
+# Service :swarm_timeliner, image: 'dtorry/swarm_timeliner:latest', ports: 7000 do
+#   network :grafana_network
+#   network :default
+#   volume '/var/run/docker.sock:/var/run/docker.sock'
+#   env BASE_LOKI_URL: 'http://loki:3100/loki/api/v1'
+# end
+
+# https://grafana.com/orgs/victoriametrics/dashboards
+Service :victoriametrics, image: 'victoriametrics/victoria-metrics:latest', ports: 8428 do
+  # /metrics/api/v1/query
+  network :default
+  network :grafana_network
+  ingress  host: 'metrics.grafana-network.*', basic_auth: basic_auth
+  deploy resources: { 'limits.memory': '1 G' }
+
+  command %w[
+    -retentionPeriod=3d
+    -storageDataPath=/storage
+    -httpListenAddr=:8428
+    -maxLabelsPerTimeseries=110
+  ]
+  volume target: '/storage', name: 'victoriametrics_data'
+end
+
+Service :vmagent, image: 'victoriametrics/vmagent:latest' do
+  command %w[
+   -promscrape.config=/etc/vmagent.yaml
+   -remoteWrite.url=http://victoriametrics:8428/api/v1/write
+   -promscrape.config.strictParse=false
+   -promscrape.maxScrapeSize=33554432
+   -promscrape.dockerswarmSDCheckInterval=10s
+  ]
+  network :grafana_network
+  network :default
+  deploy resources: { 'limits.memory': '512 M' }
+  volume '/var/run/docker.sock:/var/run/docker.sock:ro'
+  vmagent_yaml = <<~'YAML'
+    global:
+      scrape_interval:     15s
+    scrape_configs: [
+      { job_name: "tempo", static_configs: [ { targets: ["tempo:3200"] } ] },
+      { job_name: "cadvisor",
+        static_configs: [ { targets: ["cadvisor:8080"] } ],
+        metric_relabel_configs: [
+          { action: "labeldrop", regex: "container_label_com_gitlab_ci_.*" },
+          { action: "labeldrop", regex: "container_label_org_label_schema_.*" },
+          { action: "labeldrop", regex: "container_label_org_opencontainers_.*" },
+          { action: "labeldrop", regex: "container_label_com_docker_compose_.*" },
+          { action: "labeldrop", regex: "container_label_com_docker_swarm_(node_id|service_id|task_name)" },
+          { action: "labeldrop", regex: "container_label_com_docker_stack_image" },
+          { action: "labeldrop", regex: "container_label_docker_service_name" },
+          { action: "labeldrop", regex: "container_label_maintainer" }
+        ]
+      },
+      { job_name: "docker_state_exporter", static_configs: [ { targets: ["docker_state_exporter:8080"] } ] },
+      { job_name: "node-exporter", static_configs: [ { targets: ["node_exporter:9100"] } ] },
+      { job_name: "loki", metrics_path: /metrics, static_configs: [ { targets: ["loki:3100"] } ] },
+      { job_name: "traefik", metrics_path: /metrics, static_configs: [ { targets: [ traefik:9090 ] } ] },
+      { job_name: "prometheus_nats_exporter", metrics_path: /metrics, static_configs: [ { targets: [ prometheus_nats_exporter:7777 ] } ] },
+      { job_name: "victoriametrics", static_configs: [ { targets: [victoriametrics:8428] } ] },
+      { job_name: "vmagent", static_configs: [ { targets: [localhost:8429] } ] },
+      { job_name: "dockerswarm_dynamic", scrape_interval: 15s,
+        dockerswarm_sd_configs: [ { host: 'unix:///var/run/docker.sock', role: 'tasks' } ],
+        relabel_configs: [
+          { source_labels: [__meta_dockerswarm_task_desired_state], regex: 'running', action: keep },
+          { source_labels: [__meta_dockerswarm_service_label_metrics_port], regex: '[0-9]+', action: keep },
+          { source_labels: [__meta_dockerswarm_network_name], regex: 'grafana-network', action: keep },
+          { source_labels: [__meta_dockerswarm_service_label_metrics_path], regex: '(.+)', target_label: __metrics_path__, replacement: '$1', action: replace },
+          { source_labels: [__meta_dockerswarm_service_label_metrics_scheme], regex: '(https?)', target_label: __scheme__, replacement: '$1', action: replace },
+          { source_labels: [__address__, __meta_dockerswarm_service_label_metrics_port], regex: '([^:]+)(?::[0-9]+)?;([0-9]+)', target_label: __address__, replacement: '$1:$2', action: replace },
+          { source_labels: [__meta_dockerswarm_service_name], target_label: service_name, action: replace },
+          { source_labels: [__meta_dockerswarm_service_label_com_docker_stack_namespace], target_label: stack, action: replace },
+          { source_labels: [__meta_dockerswarm_service_name, __meta_dockerswarm_task_slot, __meta_dockerswarm_task_id], regex: '(.+);(.+);(.+)', target_label: instance, replacement: '$1.$2.$3', action: replace },
+          { source_labels: [__meta_dockerswarm_node_hostname], target_label: swarm_node, action: replace },
+          { source_labels: [__meta_dockerswarm_service_label_stack_product], regex: '(.+)', target_label: stack_product, replacement: '$1', action: replace }
+        ]
+      },
+    ]
+  YAML
+  if ENV['GPU_NODE']
+    require 'yaml'
+    ext_yaml = <<~'YAML'
+      scrape_configs: [
+        { job_name: dcgm_exporter, metrics_path: /metrics, static_configs: [ { targets: [dcgm_exporter:9400] } ] }
+      ]
+    YAML
+    base = YAML.safe_load(vmagent_yaml, aliases: true)
+    ext = YAML.safe_load(ext_yaml, aliases: true)
+    base['scrape_configs'] += ext['scrape_configs']
+    vmagent_yaml = YAML.dump(base).sub(/\A---\s*\n/, '')
+   end
+
+  config target: '/etc/vmagent.yaml', file_content: vmagent_yaml
+end
+
+# Service :prometheus, image: 'prom/prometheus:latest' do
+#   command %w[
+#     --web.enable-remote-write-receiver
+#     --enable-feature=exemplar-storage
+#     --config.file=/etc/prometheus.yaml
+#     --storage.tsdb.retention.time=2d
+#     --storage.tsdb.retention.size=25GB
+#   ]
+#   network :grafana_network
+#   network :default
+#   volume target: '/prometheus', name: 'prometheus_data'
+#   #  { job_name: 'speedtest', metrics_path: /probe, params: { script: [speedtest] }, static_configs: [ {targets: [speedtest_exporter:9469]}], scrape_interval: 10m, scrape_timeout: 60s },
+#   config target: '/etc/prometheus.yaml', file_content: <<~YAML
+#     global:
+#       scrape_interval:     15s
+#       evaluation_interval: 15s
+#     scrape_configs: [
+#       { job_name: 'script_exporter', metrics_path: /metrics, static_configs: [ { targets: [ speedtest_exporter:9469 ] } ] },
+#       { job_name: "prometheus", static_configs: [ { targets: ["localhost:9090"] } ] },
+#       { job_name: "tempo", static_configs: [ { targets: ["tempo:3200"] } ] },
+#       { job_name: "cadvisor", static_configs: [ { targets: ["cadvisor:8080"] } ] },
+#       { job_name: "docker_state_exporter", static_configs: [ { targets: ["docker_state_exporter:8080"] } ] },
+#       { job_name: "node-exporter", static_configs: [ { targets: ["node_exporter:9100"] } ] },
+#       { job_name: "loki", metrics_path: /metrics, static_configs: [ { targets: ["loki:3100"] } ] },
+#       { job_name: "traefik", metrics_path: /metrics, static_configs: [ { targets: [ traefik:9090 ] } ] },
+#       { job_name: "prometheus_nats_exporter", metrics_path: /metrics, static_configs: [ { targets: [ prometheus_nats_exporter:7777 ] } ] },
+#       { job_name: "victoriametrics", static_configs: [ { targets: [victoriametrics:8428] } ] },
+#       { job_name: "vmagent", static_configs: [ { targets: [vmagent:8428] } ] }
+#     ]
+#   YAML
+# end
+
+# https://grafana.com/docs/grafana/latest/breaking-changes/breaking-changes-v11-0/
+Service :grafana, image: 'grafana/grafana:latest', ports: 3000 do
+  env GF_ADMIN_USER: 'admin'
+  env GF_ADMIN_PASSWORD: ENV.fetch('GF_ADMIN_PASSWORD', 'admin')
+  env GF_AUTH_ANONYMOUS_ENABLED: false
+  env GF_SERVER_SERVE_FROM_SUB_PATH: true
+  env GF_SERVER_ROOT_URL: '/map/grafana'
+  # env GF_SERVER_ROOT_URL: "#{ENV['SCHEME']}://#{ENV['MAIN_DOMAIN']}/map/grafana"
+  # env GF_SERVER_ROOT_URL: "https://tempo.#{ENV['MAIN_DOMAIN']}"
+  if ENV['DOCKER_PROXY']
+    env HTTP_PROXY: ENV['DOCKER_PROXY']
+    env HTTPS_PROXY: ENV['DOCKER_PROXY']
+    env NO_PROXY: "localhost,127.0.0.1,prometheus,victoriametrics,tempo,loki,#{ENV['DOCKER_NOPROXY']}"
+  end
+
+  # env GF_AUTH_GENERIC_OAUTH_ENABLED: true
+  # env GF_AUTH_GENERIC_OAUTH_EMAIL_ATTRIBUTE: 'email'
+  # env GF_AUTH_GENERIC_OAUTH_USERNAME_ATTRIBUTE: 'admin'
+  # env GF_AUTH_GENERIC_OAUTH_EMAIL_ATTRIBUTE_PATH: 'email'
+  # env GF_AUTH_GENERIC_OAUTH_ALLOW_UPDATE: true
+  # env GF_AUTH_GENERIC_OAUTH_AUTO_ASSIGN_ORG_ROLE: 'Admin'
+  # env GF_AUTH_GENERIC_OAUTH_SKIP_ORG_ROLE_SYNC: true
+  # env GF_AUTH_GENERIC_OAUTH_IGNORE_PASSWORD_UPDATE: true
+  # env GF_AUTH_GENERIC_OAUTH_ALLOW_SIGN_UP: true
+  # # env GF_AUTH_GENERIC_OAUTH_SKIP_ORG_ROLE_SYNC_FOR_EXISTING_USERS: false
+  # env GF_AUTH_GENERIC_OAUTH_AUTH_ID_ATTRIBUTE: 'admin' # sub
+  # env GF_AUTH_OAUTH_ALLOW_INSECURE_EMAIL_LOOKUP: true
+  # env GF_AUTH_GENERIC_OAUTH_AUTO_ASSIGN_ORG_ROLE: 'Admin'
+  # env GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH: "'Admin'"
+  # # env GF_AUTH_GENERIC_OAUTH_ROLE_ATTRIBUTE_PATH: "contains(roles[*], 'admin') && 'Admin' || contains(roles[*], 'editor') && 'Editor' || 'Viewer'"
+  # # env GF_USERS_ALLOW_DELETE_ADMIN: true
+  # env GF_AUTH_GENERIC_OAUTH_ALLOW_ASSIGN_GRAFANA_ADMIN: true
+  # env GF_AUTH_GENERIC_OAUTH_IDENTIFY_ATTRIBUTE_PATH: 'admin'
+  # env GF_AUTH_GENERIC_OAUTH_ID_TOKEN_ATTRIBUTE_NAME: 'admin' # 'sub'
+  # env GF_AUTH_GENERIC_OAUTH_AUTH_URL: "https://#{ENV['MAIN_DOMAIN']}/authorize"
+  # env GF_AUTH_GENERIC_OAUTH_TOKEN_URL: "http://oauth2_oauth2_slim:7000/oauth/token"
+  # env GF_AUTH_GENERIC_OAUTH_API_URL: "http://oauth2_oauth2_slim:7000/oauth/user"
+
+  # [plugins]
+  # allow_loading_unsigned_plugins = docker-events-analyzer
+  env GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS: 'docker-events-analyzer'
+  config target: '/var/lib/grafana/plugins/docker_events_analyzer/plugin.json', file: './gf_plugins/docker_events_analyzer/plugin.json'
+  config target: '/var/lib/grafana/plugins/docker_events_analyzer/module.js', file: './gf_plugins/docker_events_analyzer/module.js'
+
+  network :grafana_network
+  network :default
+  config :grafana_datasources_yaml, target: '/etc/grafana/provisioning/datasources/datasources.yaml'
+  config :grafana_dashboards_yaml, target: '/etc/grafana/provisioning/dashboards/main.yaml'
+  config target: '/var/lib/grafana/dashboards/traefik.json', file: './dashboards/traefik.json'
+  config target: '/var/lib/grafana/dashboards/cadvisor.json', file: './dashboards/cadvisor.json'
+  config target: '/var/lib/grafana/dashboards/cadvisor2.json', file: './dashboards/cadvisor2.json'
+  # config target: '/var/lib/grafana/dashboards/speedtest.json', file: './dashboards/speedtest.json'
+  config target: '/var/lib/grafana/dashboards/node_exporter.json', file: './dashboards/node_exporter.json' # https://grafana.com/grafana/dashboards/1860-node-exporter-full/
+  config target: '/var/lib/grafana/dashboards/swarm_stack.json', file: './dashboards/swarm_stack.json' # https://grafana.com/grafana/dashboards/7007-swarm-stack-monitoring/
+  config target: '/var/lib/grafana/dashboards/loki.json', file: './dashboards/loki.json' # https://grafana.com/grafana/dashboards/17781-loki-metrics-dashboard/
+  config target: '/var/lib/grafana/dashboards/loki_ingest_metrics.json', file: './dashboards/loki_ingest_metrics.json'
+  config target: '/var/lib/grafana/dashboards/tempo_span_metrics.json', file: './dashboards/tempo_span_metrics.json'
+  # config target: '/var/lib/grafana/dashboards/prometheus_20_stats.json', file: './dashboards/prometheus_20_stats.json'
+  config target: '/var/lib/grafana/dashboards/nats_jetstreams.json', file: './dashboards/nats_jetstreams.json'
+  config target: '/var/lib/grafana/dashboards/nats_servers.json', file: './dashboards/nats_servers.json'
+  config target: '/var/lib/grafana/dashboards/vm_single_node.json', file: './dashboards/vm_single_node.json'
+  config target: '/var/lib/grafana/dashboards/cadvisor_19792_rev6.json', file: './dashboards/cadvisor_19792_rev6.json'
+  if ENV['GPU_NODE']
+    config target: '/var/lib/grafana/dashboards/gpus.json', file: './dashboards/gpus.json'
+    config target: '/var/lib/grafana/dashboards/gpus2.json', file: './dashboards/gpus2.json'
+    config target: '/var/lib/grafana/dashboards/gpus3.json', file: './dashboards/gpus3.json'
+    config target: '/var/lib/grafana/dashboards/nvidia_dcgm_v1.json', file: './dashboards/nvidia_dcgm_v1.json'
+  end
+
+  config target: '/etc/grafana/provisioning/alerting/alert_rules.yaml', file: './alerting/alert_rules.yaml'
+  # config target: '/etc/grafana/provisioning/alerting/policies.yaml', file: './alerting/policies.yaml'
+
+  if ENV['TELEGRAM_BOT_TOKEN'] && ENV['TELEGRAM_CHAT_ID']
+    config target: '/etc/grafana/provisioning/alerting/contact_points.yaml', file_content: <<~YAML
+      apiVersion: 1
+      contactPoints:
+        - orgId: 1
+          name: Telegram
+          receivers:
+            - uid: telegram-alerts
+              type: telegram
+              settings:
+                bottoken: #{ENV['TELEGRAM_BOT_TOKEN'].to_s.dump}
+                chatid: #{ENV['TELEGRAM_CHAT_ID'].to_s.dump}
+                disable_notification: false
+                disable_web_page_preview: false
+                message: |
+                  <strong>Grafana (#{ENV['MAIN_DOMAIN']}):</strong>
+                  {{- range .Alerts.Firing }}
+                  - [F] {{ index .Labels "alertname" }}: {{ .Annotations.summary }} {{ .Annotations.description }}
+                  {{- end }}
+                  {{- range .Alerts.Resolved }}
+                  - [R] {{ index .Labels "alertname" }}: {{ .Annotations.summary }} {{ .Annotations.description }}
+                  {{ end }}
+                parse_mode: HTML
+                protect_content: false
+              disableResolveMessage: false
+    YAML
+  end
+end
+
+# https://medium.com/@ahmadbilalch891/how-to-set-up-grafana-loki-and-prometheus-locally-with-docker-compose-part-1-of-3-62fb25e51d92
+Service :loki, image: 'grafana/loki:latest', ports: 3100 do
+  command <<~CC
+    -config.file=/etc/loki/local-config.yaml
+    -distributor.ring.instance-addr=127.0.0.1
+    -frontend.instance-addr=127.0.0.1
+    -index-gateway.ring.instance-addr=127.0.0.1
+    -ingester.lifecycler.addr=127.0.0.1
+    -query-scheduler.ring.instance-addr=127.0.0.1
+    -ruler.ring.instance-addr=127.0.0.1
+  CC
+  network :default
+  network :grafana_network
+  ingress  host: 'loki.grafana-network.*', basic_auth: basic_auth, port: 3100
+  deploy resources: { 'limits.memory': '1 G' }
+
+  volume target: '/data', name: 'loki_data'
+  user '0:0'
+  config target: '/etc/loki/local-config.yaml', file_content: <<~YAML
+        auth_enabled: false
+        server:
+    #      http_listen_address: 0.0.0.0
+    #      grpc_listen_address: 0.0.0.0
+    #      http_listen_port: 3100
+    #      grpc_listen_port: 9095
+          log_level: debug
+        common:
+    #      instance_interface_names: 
+    #        - "lo"
+          ring:
+            instance_addr: 127.0.0.1
+            kvstore:
+              store: inmemory
+          replication_factor: 1
+          path_prefix: /data/loki
+        compactor:
+          working_directory: /data/loki/compactor
+          compaction_interval: 5m
+          retention_enabled: true
+          delete_request_store: filesystem
+        schema_config:
+          configs:
+          - from: 2020-05-15
+            store: tsdb
+            object_store: filesystem
+            schema: v13
+            index:
+              prefix: index_
+              period: 24h
+        ingester:
+          lifecycler:
+            address: 0.0.0.0
+            ring:
+              kvstore:
+                store: inmemory
+              replication_factor: 1
+            final_sleep: 0s
+            min_ready_duration: 15s
+          chunk_idle_period: 5m
+          chunk_target_size: 1048576
+          max_chunk_age: 30m
+        limits_config:
+          ingestion_rate_mb: 16
+          ingestion_burst_size_mb: 32
+          max_global_streams_per_user: 5000
+          retention_period: 240h # 10 days       
+        table_manager:
+          retention_deletes_enabled: true
+          retention_period: 240h # 10 days
+        analytics:
+          reporting_enabled: false
+        storage_config:
+          filesystem:
+            directory: /data/loki/chunks
+  YAML
+end
+
+# https://docs.fluentbit.io/manual/pipeline/outputs/loki
+Service :fluent_bit2, image: 'fluent/fluent-bit:latest' do
+  volume '/var/run/docker.sock:/var/run/docker.sock'  # Required for Docker API access
+  config target: '/fluent-bit/etc/parsers2.conf', file_content: <<~CONF
+    [PARSER]
+        Name         docker_events_json
+        Format       json
+        Time_Key     time
+  CONF
+  config target: '/fluent-bit/etc/fluent-bit.conf', file_content: <<~CONF
+    [SERVICE]
+      flush        10
+      daemon       Off
+      parsers_file parsers.conf
+      parsers_file parsers2.conf
+      plugins_file plugins.conf
+      log_level    info
+
+    [INPUT]
+        Name   docker_events
+        Parser docker_events_json
+
+    [OUTPUT]
+        Name             loki
+        Match            *
+        Host             loki
+        Port             3100
+        Labels           job=docker_events
+        Line_Format      json
+  CONF
+end
+
+Service :promtail, image: 'grafana/promtail:latest' do
+  volume '/var/run/docker.sock:/var/run/docker.sock'  # Required for Docker API access
+  volume '/var/lib/docker/containers:/var/lib/docker/containers:ro'  # Container logs
+  volume '/var/log:/var/log'  # Access to system logs (e.g., Docker daemon logs)
+  volume target: '/etc/promtail'
+  command "-config.file=/etc/promtail/promtail-config.yml" #  --dry-run --inspect
+
+  network :grafana_network
+  network :default
+  # deploy resources: { 'limits.memory': '500 M' }
+
+  config target: '/etc/promtail/promtail-config.yml', file_content: <<~YAML
+    server: { http_listen_port: 9080, grpc_listen_port: 0 }
+    positions: { filename: /var/log/positions.yaml }
+    clients: [ url: http://loki:3100/loki/api/v1/push ]
+
+    scrape_configs:
+      - job_name: journal
+        journal:
+          path: /var/log/journal
+          max_age: 1h
+          labels:
+            job: systemd-journal
+        relabel_configs:
+          - source_labels: [ __journal__hostname ]
+            target_label: hostname
+          - source_labels: [ __journal__systemd_unit ] # example label values: kubelet.service, containerd.service
+            target_label: unit
+          - source_labels: [ __journal_priority_keyword ] # example label values: debug, notice, info, warning, error
+            target_label: level
+  YAML
+end
+
+Service :cadvisor, image: 'gcr.io/cadvisor/cadvisor:v0.55.1', ports: 8080 do
+  command %w[
+    -containerd=/run/containerd/containerd.sock
+    -store_container_labels=false
+    -whitelisted_container_labels=com.docker.stack.namespace,com.docker.swarm.service.name,com.docker.swarm.task.id
+    -housekeeping_interval=15s
+    -max_housekeeping_interval=2m
+    -event_storage_age_limit=default=1h
+    -event_storage_event_limit=default=1000
+  ]
+  # -docker_only
+  # -disable_root_cgroup_stats
+  # cap_add %w[SYS_ADMIN] # manager.go:338 Could not configure a source for OOM detection, disabling OOM events: open /dev/kmsg: operation not permitted
+  cap_add %w[ALL]
+  volume '/run/containerd/containerd.sock:/run/containerd/containerd.sock:ro'
+  volume '/var/lib/containerd:/var/lib/containerd:ro'
+  volume '/:/rootfs:ro'
+  volume '/var/run:/var/run:rw'
+  volume '/proc:/host-proc:ro'
+  volume '/sys:/sys:ro'
+  volume '/var/lib/docker/:/var/lib/docker:ro'
+  volume '/dev/disk/:/dev/disk:ro'
+  volume '/dev/kmsg:/dev/kmsg'
+  # volume '/dev/zfs:/dev/zfs:ro'
+  network :grafana_network
+  network :default
+end
+
+# HACK
+# version: "3.7"
+#
+# services:
+#   cadvisor:
+#     image: docker
+#     volumes:
+#         - /var/run/docker.sock:/var/run/docker.sock
+#     entrypoint: ["/bin/sh","-c"]
+#     networks:
+#     - monitoring
+#     deploy:
+#       mode: global
+#     environment:
+#       - PARENT={{.Task.Name}}
+#       - CHILDNAME={{.Service.Name}}_sidecar.{{.Node.ID}}.{{.Task.ID}}
+#       - CADVISOR_VERSION=v0.37.5
+#     command:
+#     - |
+#       exec docker run -i --rm --network="container:$${PARENT}" \
+#             --volume=/:/rootfs:ro \
+#             --volume=/var/run:/var/run:ro  \
+#             --volume=/sys:/sys:ro  \
+#             --volume=/var/lib/docker/:/var/lib/docker:ro \
+#             --volume=/dev/disk/:/dev/disk:ro \
+#             --name $${CHILDNAME} \
+#             --privileged \
+#             --device=/dev/kmsg \
+#             gcr.io/cadvisor/cadvisor:$${CADVISOR_VERSION}
+
+Service :node_exporter, image: 'prom/node-exporter:latest', ports: 9100 do
+  volume '/:/host:ro,rslave'
+  # --collector.filesystem.mount-points-include=^/(var/lib/docker/.+|var/lib/swapspace|var/lib/log)($$|/)
+  command '--path.rootfs=/host'
+end
+
+# TODO: update
+#   "Error response from daemon: client version 1.41 is too old. Minimum supported API version is 1.44, please upgrade your client to a newer version",
+Service :docker_state_exporter, image: 'ghcr.io/artyomb/docker_state_exporter:latest', ports: 8080 do
+  volume '/var/run/docker.sock:/var/run/docker.sock'
+end
+
+Service :otlp_collector, image: 'otel/opentelemetry-collector-contrib:0.102.0', ports: 4318 do
+  network :grafana_network
+  network :default
+  deploy resources: { 'limits.memory': '500 M' } # usual 45 Mb
+  config :otlp_yaml, target: '/etc/otelcol-contrib/config.yaml'
+end
+
+# Service :speedtest_exporter, image: 'billimek/prometheus-speedtest-exporter:latest' do
+#   network :grafana_network
+#   network :default
+# end
+
+Config :otlp_yaml, file_content: <<~YAML
+    receivers:
+      otlp:
+        protocols:
+          http:
+          grpc:
+    exporters:
+  #    debug:
+  #      verbosity: detailed
+  #      sampling_initial: 5
+  #      sampling_thereafter: 200
+      otlphttp/tempo:
+        endpoint: http://tempo:4318
+        tls:
+          insecure: true
+      prometheusremotewrite:
+  #      endpoint: http://prometheus:9090/api/v1/write
+        endpoint: http://victoriametrics:8428/api/v1/write
+        resource_to_telemetry_conversion:
+          enabled: true
+      loki:
+        endpoint: http://loki:3100/loki/api/v1/push
+        tls:
+          insecure: true
+    service:
+      pipelines:
+        traces:
+          receivers: [ otlp ]
+          exporters: [ otlphttp/tempo ]
+        metrics:
+          receivers: [ otlp]
+          exporters: [ prometheusremotewrite ]
+        logs:
+          receivers: [ otlp]
+          exporters: [ loki ]
+YAML
+
+Config :tempo_yaml, file_content: <<~YAML
+  # Defaults: https://github.com/grafana/tempo/blob/2870e82df7045b41c166da4a624ae8d68c0e6394/docs/sources/tempo/configuration/manifest.md?plain=1#L499
+  stream_over_http_enabled: true
+  usage_report:
+    reporting_enabled: false
+  server:
+    http_listen_port: 3200
+    log_level: info
+
+  memberlist:
+    bind_addr:
+      - 0.0.0.0
+    join_members:
+      - tempo:7946
+
+  query_frontend:
+    search:
+      duration_slo: 5s
+      throughput_bytes_slo: 1.073741824e+09
+    trace_by_id:
+      duration_slo: 5s
+
+  querier:
+    frontend_worker:
+      frontend_address: 127.0.0.1:9095
+
+  distributor:
+    receivers:                           # this configuration will listen on all ports and protocols that tempo is capable of.
+      otlp:
+        protocols:
+          http:
+            endpoint: "0.0.0.0:4318"
+
+  metrics_generator:
+    # https://grafana.com/docs/tempo/latest/configuration/#metrics-generator
+    processor:
+      # Span metrics create metrics based on span type, duration, name and service.
+      span_metrics:
+        # Configure extra dimensions to add as metric labels.
+        dimensions:
+          - deployment.environment
+      service_graphs:
+        # Enables additional labels for services and virtual nodes.
+        enable_virtual_node_label: true
+        peer_attributes:
+          - peer.service
+          - service.name # +
+          - host.name # +
+          - db.name
+          - db.system
+        dimensions:
+          - deployment.environment
+      local_blocks:
+        flush_to_storage: true
+
+    registry:
+      external_labels:
+        source: tempo
+        cluster: docker-compose
+    storage:
+      path: /var/tempo/generator/wal
+      remote_write:
+        # - url: http://prometheus:9090/api/v1/write
+        - url: http://victoriametrics:8428/api/v1/write
+          send_exemplars: true
+    traces_storage:
+      path: /var/tempo/generator/traces
+
+  compactor:
+    compaction:
+      block_retention: 168h
+      compacted_block_retention: 1h
+
+  storage:
+    trace:
+      backend: local                     # backend configuration to use
+      wal:
+        path: /var/tempo/wal             # where to store the the wal locally
+      local:
+        path: /var/tempo/blocks
+
+  overrides:
+    defaults:
+      ingestion:
+        max_traces_per_user: 50000
+      metrics_generator:
+        # https://grafana.com/docs/tempo/latest/configuration/#overrides
+        processors: [service-graphs, span-metrics, local-blocks] # enables metrics generator
+
+YAML
+
+Config :grafana_datasources_yaml, file_content: <<~YAML
+  apiVersion: 1
+
+  datasources:
+  - name: Loki # Display name
+    type: loki # Datasource type
+    uid: loki
+    access: proxy #
+    orgId: 1 # Grafana organization ID
+    url: http://loki:3100 # Internal Loki service URL
+    basicAuth: false # Loki auth is disabled in this demo stack
+    isDefault: false #
+    version: 1 #
+    editable: false # Keep datasource managed by provisioning
+  
+  # This "Prometheus" datasource actually points to VictoriaMetrics
+  # Keep uid: prometheus to avoid changing dashboards
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    orgId: 1
+    url: http://victoriametrics:8428
+    # url: http://prometheus:9090
+    basicAuth: false
+    isDefault: false
+    version: 1
+    editable: false
+    jsonData:
+      httpMethod: GET
+  - name: Tempo
+    type: tempo
+    access: proxy
+    orgId: 1
+    url: http://tempo:3200
+    basicAuth: false
+    isDefault: true
+    version: 1
+    editable: false
+    apiVersion: 1
+    uid: tempo
+    jsonData:
+      # httpMethod: GET
+      serviceMap:
+        datasourceUid: prometheus
+YAML
+
+Config :grafana_dashboards_yaml, file_content: <<~YAML
+  apiVersion: 1
+
+  providers:
+    - name: "Dashboard provider"
+      orgId: 1
+      type: file
+      disableDeletion: false
+      updateIntervalSeconds: 10
+      allowUiUpdates: false
+      options:
+        path: /var/lib/grafana/dashboards
+        foldersFromFilesStructure: true
+YAML
+
+Network :grafana_network, external: true , name: 'grafana-network'

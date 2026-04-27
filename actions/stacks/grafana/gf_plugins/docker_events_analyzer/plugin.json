@@ -1,0 +1,18 @@
+{
+  "type": "panel",
+  "name": "Docker Events Analyzer",
+  "id": "docker-events-analyzer",
+  "info": {
+    "description": "Analyzes Docker events from Loki logs",
+    "author": {
+      "name": "Your Name"
+    },
+    "keywords": ["docker", "events", "loki", "logs"],
+    "version": "1.0.0",
+    "updated": "2024-04-16"
+  },
+  "dependencies": {
+    "grafanaDependency": ">=9.0.0",
+    "plugins": []
+  }
+}

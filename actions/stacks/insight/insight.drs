@@ -1,0 +1,33 @@
+Options name: 'stack-insight', traefik: true, traefik_tls: !!ENV['TLS_DOMAIN'], tls_domain: ENV['TLS_DOMAIN']
+
+basic_auth = ENV.fetch('INSIGHT_BASIC_AUTH', ENV.fetch('TRAEFIK_BASIC_AUTH', 'admin:admin:demo'))
+
+Ingress stack_insight: [{ host: 'insight.*', basic_auth: basic_auth },
+                        { host: '*', path: '/insight', path_sub: ['^/insight(.*)', '$1'], basic_auth: basic_auth},
+                        { host: '*', path: '/map/insight', path_sub: ['^/map/insight(.*)', '$1'], basic_auth: basic_auth}
+]
+
+Deploy stack_insight: { placement: { constraints: ['node.role == manager'] } }
+
+Service :stack_insight, image: 'dtorry/stack-insight', ports: 7000 do
+  network :default
+  network :grafana_network, name: 'grafana-network', external: true
+  deploy_label 'metrics.port=7000'
+  # deploy_label 'metrics.path=/metrics'
+
+  volume '/var/run/docker.sock:/var/run/docker.sock'
+  volume '/root/.docker/config.json:/root/.docker/config.json'
+  volume '/var/log/journal:/var/log/journal:ro'
+  volume '/run/systemd/journal:/run/systemd/journal:ro'
+  env CONTAINER_SIZE: ENV['INSIGHT_CONTAINER_SIZE']
+  if ENV['NO_NT']
+    # env NT_MAPPING: 'host:docker exec -it "$$(docker ps -q --filter label=com.docker.swarm.service.name=grafana_cadvisor)" nsenter --mount=/host-proc/1/ns/mnt --uts=/host-proc/1/ns/uts --net=/host-proc/1/ns/net --ipc=/host-proc/1/ns/ipc sh'
+  else
+    env NT_MAPPING: '0:docker run --rm -it --privileged --pid=host alpine:edge nsenter -t 1 -m -u -n -i bash'
+    # /usr/sbin/sshd -Dddd -e -p 2222 -o UsePAM=no
+    # /usr/sbin/sshd -D -e -p 2222 -o UsePAM=no -o LogLevel=DEBUG3
+    # systemctl restart systemd-logind && sleep 3 && systemctl status systemd-logind --no-pager --full
+  end
+
+  oauth_provider 'oauth2_oauth2_slim:7000/auth'
+end

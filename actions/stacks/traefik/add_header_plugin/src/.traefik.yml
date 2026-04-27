@@ -1,0 +1,17 @@
+displayName: Plugin add_header_plugin
+type: middleware
+#iconPath: .assets/icon.png
+
+import: add_header_plugin
+
+summary: 'Add Request Headers'
+
+testData:
+  http:
+    middlewares:
+      add-header:
+        plugin:
+          add_header_plugin:
+            rules:
+              - regex: "^(.{0,10})"
+                header: "HTTP_PATH"

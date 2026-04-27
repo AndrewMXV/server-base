@@ -1,0 +1,14 @@
+.bundle/
+vendor/bundle/
+Gemfile.lock
+.env
+.env.*
+*.log
+
+# dry-stack generated configs
+*.config.*
+
+# local/editor state
+.idea/
+.vscode/
+*.iml

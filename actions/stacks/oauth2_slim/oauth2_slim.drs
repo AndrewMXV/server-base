@@ -1,0 +1,20 @@
+Options name: 'oauth2'
+
+Service :oauth2_slim, image: 'dtorry/oauth2-slim:latest', ports: 7000 do
+  deploy placement: { constraints: ['node.role == manager'] }
+  network :default
+  network :grafana_network, name: 'grafana-network', external: true
+  deploy_label 'metrics.port=7000'
+
+  ingress path: '/{path:(.*oauth_slim/authorize)}' # Traefik v2
+  ingress path: '/oauth_slim', path_sub: ['/oauth_slim(.*)', '$1']
+  env FORWARD_OAUTH_AUTH_URL: ENV['FORWARD_OAUTH_AUTH_URL'] ||'/oauth_slim/authorize'
+  env AUTH_SCOPE: ENV['MAIN_DOMAIN']
+  env AUTH_BOT: ENV.fetch('AUTH_BOT', 'slim_auth_bot')
+  env AUTH_VERIFY_KEY: ENV.fetch('AUTH_VERIFY_KEY', 'demo-verify-key')
+
+  env CONSOLE_OUTPUT: 'XTerm', # JSON,Text,XTerm,Default
+      CONSOLE_LEVEL: ENV.fetch('CONSOLE_LEVEL', 'all')
+
+  volume name: 'oauth2-slim', target: '/private_keys'
+end
