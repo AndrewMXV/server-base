@@ -1,0 +1,440 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "io/console"
+require "optparse"
+require "rbconfig"
+require_relative "../lib/deploy"
+
+ROOT = File.expand_path("..", __dir__)
+CONFIG_DIR = File.join(ROOT, "config")
+DEPLOY_BIN = File.join(ROOT, "bin", "deploy")
+RESET = "\e[0m"
+DIR_COLOR = "\e[36m"
+SELECTED_BG = "\e[44m"
+SELECTED_FG = "\e[97m"
+HEADER_COLOR = "\e[1m\e[33m"
+UNKNOWN_VALUE = "?"
+INPUT = IO.console || (File.open("/dev/tty", "r+") rescue nil)
+MOUSE_ON = "\e[?1000h\e[?1006h"
+MOUSE_OFF = "\e[?1000l\e[?1006l"
+DEBUG_TRUE_VALUES = %w[1 true yes on].freeze
+
+def deploy_debug? = @deploy_debug == true
+def toggle_deploy_debug! = @deploy_debug = !deploy_debug?
+def init_deploy_debug_from_env! = @deploy_debug = DEBUG_TRUE_VALUES.include?(ENV.fetch("DEBUG", "").strip.downcase)
+
+def parse_menu_options!(argv)
+  opts = {}
+  OptionParser.new do |o|
+    o.banner = "Usage: deploy-menu [--debug|--no-debug]"
+    o.on("--debug", "Enable debug mode for deploy command") { opts[:debug] = true }
+    o.on("--no-debug", "Disable debug mode for deploy command") { opts[:debug] = false }
+  end.parse!(argv)
+  @deploy_debug = opts[:debug] unless opts[:debug].nil?
+end
+
+def select_from(prompt, items, index: 0, header: nil, click_actions: nil)
+  raise "#{prompt} list is empty" if items.empty?
+
+  if console_tty?
+    select_with_arrows(prompt, items, index: index, header: header, click_actions: click_actions)
+  else
+    select_with_numbers(prompt, items)
+  end
+end
+
+def select_with_numbers(prompt, items)
+  puts prompt
+  items.each_with_index { |item, index| puts format("%2d) %s", index + 1, item) }
+  print "> "
+  input = read_line&.strip
+  return [:quit, 0] if input == "q" || input == "Q"
+  raise "No selection provided" if input.nil? || input.empty?
+
+  index = Integer(input, 10) rescue nil
+  raise "Invalid selection: #{input}" unless index && index.between?(1, items.size)
+
+  [items[index - 1], index - 1]
+end
+
+def select_with_arrows(prompt, items, index: 0, header: nil, click_actions: nil)
+  index = 0 unless index.between?(0, items.size - 1)
+  clear_screen
+  prompt_text = "#{prompt} (use ↑/↓, Enter, Backspace=up, q=quit)"
+  @menu_prompt_lines = wrapped_lines(prompt_text)
+  @menu_header_lines = header ? wrapped_lines(header) : 0
+  @menu_items_count = items.size
+  last_click_at = nil
+  last_click_index = nil
+  enable_mouse
+  puts prompt_text
+  render_menu(items, index, header: header)
+
+  begin
+    loop do
+      key = read_key
+      case key
+      when :up then index = (index - 1) % items.size
+      when :down then index = (index + 1) % items.size
+      when :back then return [:back, index]
+      when :quit then return [:quit, index]
+      when :enter then break
+      when Array
+        if key[0] == :mouse
+          button, _x, y, type = key[1], key[2], key[3], key[4]
+          next unless type == "M"
+
+          clicked = mouse_index(y)
+          next unless clicked
+
+          index = clicked
+          redraw_menu(items, index)
+          if button == 0
+            if click_actions&.[](index)
+              return [items[index], index]
+            end
+            now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+            if last_click_index == index && last_click_at && (now - last_click_at) < 0.5
+              return [items[index], index]
+            end
+            last_click_index = index
+            last_click_at = now
+          end
+          next
+        end
+      end
+
+      redraw_menu(items, index)
+    end
+  ensure
+    disable_mouse
+    print "\e[?25h" if $stdout.tty?
+  end
+
+  [items[index], index]
+end
+
+def read_key
+  ch = read_char
+  return nil if ch.nil?
+  return :quit if ch == "\u0003"
+  return :back if ch == "\u007F" || ch == "\b"
+  return :enter if ch == "\r" || ch == "\n"
+  return :up if ch == "k"
+  return :down if ch == "j"
+  return :quit if ch == "q" || ch == "Q"
+  return nil unless ch == "\e"
+
+  return nil unless read_char == "["
+
+  next_char = read_char
+  case next_char
+  when "A" then :up
+  when "B" then :down
+  when "<"
+    mouse = read_mouse_event
+    mouse if mouse
+  else
+    nil
+  end
+end
+
+def render_menu(items, index, header: nil)
+  print "\e[?25l" if console_tty?
+  puts format_header(header) if header
+  items.each_with_index do |item, i|
+    marker = i == index ? ">" : " "
+    puts format_item("#{marker} #{item}", selected: i == index)
+  end
+end
+
+def redraw_menu(items, index)
+  print "\e[#{items.size}A"
+  items.each_with_index do |item, i|
+    marker = i == index ? ">" : " "
+    print "\e[2K#{format_item("#{marker} #{item}", selected: i == index)}\n"
+  end
+end
+
+def clear_screen
+  return unless console_tty?
+
+  print "\e[2J\e[H"
+end
+
+def format_item(text, selected:)
+  return text unless console_tty?
+
+  if selected
+    "#{SELECTED_BG}#{SELECTED_FG}#{text}#{RESET}"
+  elsif text.end_with?("/")
+    "#{DIR_COLOR}#{text}#{RESET}"
+  else
+    text
+  end
+end
+
+def format_header(text)
+  return text unless console_tty? && text
+
+  "#{HEADER_COLOR}#{text}#{RESET}"
+end
+
+def enable_mouse
+  return unless console_tty?
+
+  print MOUSE_ON
+end
+
+def disable_mouse
+  return unless console_tty?
+
+  print MOUSE_OFF
+end
+
+def wrapped_lines(text)
+  width = (IO.console&.winsize&.[](1) || 80).to_i
+  width = 1 if width < 1
+  length = visible_length(text)
+  ((length - 1) / width) + 1
+end
+
+def visible_length(text)
+  text.to_s.gsub(/\e\[[0-9;]*m/, "").length
+end
+
+def mouse_index(row)
+  prompt_lines = @menu_prompt_lines || 1
+  header_lines = @menu_header_lines || 0
+  idx = row - prompt_lines - header_lines - 1
+  return nil unless idx.between?(0, (@menu_items_count || 0) - 1)
+
+  idx
+end
+
+def read_mouse_event
+  data = +""
+  loop do
+    ch = read_char
+    return nil if ch.nil?
+    data << ch
+    break if ch == "M" || ch == "m"
+  end
+
+  type = data[-1]
+  payload = data[0...-1]
+  parts = payload.split(";")
+  return nil unless parts.size >= 3
+
+  button = Integer(parts[0], 10) rescue nil
+  x = Integer(parts[1], 10) rescue nil
+  y = Integer(parts[2], 10) rescue nil
+  return nil unless button && x && y
+
+  [:mouse, button, x, y, type]
+end
+
+def console_tty?
+  input = INPUT
+  input && input.respond_to?(:tty?) && input.tty? && $stdout.tty?
+end
+
+def read_line
+  return INPUT.gets if INPUT
+
+  STDIN.gets
+end
+
+def read_char
+  return INPUT.getch if INPUT
+
+  STDIN.getch
+rescue StandardError
+  nil
+end
+
+def server_entries(dir_path, files, first_header: "config")
+  headers = {
+    name: first_header,
+    host: "host",
+    port: "port",
+    tls: "tls_domain",
+    main: "main_domain"
+  }
+
+  rows = files.map do |file|
+    path = File.join(dir_path, file)
+    config = config_for(path)
+    tls_value = config&.tls_domain || config&.main_domain
+    {
+      name: file.delete_suffix(".rb"),
+      host: (config&.host || UNKNOWN_VALUE).to_s,
+      port: (config&.host_port || UNKNOWN_VALUE).to_s,
+      tls: (tls_value || UNKNOWN_VALUE).to_s,
+      main: (config&.main_domain || UNKNOWN_VALUE).to_s
+    }
+  end
+
+  widths = {
+    name: [headers[:name].length, rows.map { |r| r[:name].length }.max || 0].max,
+    host: [headers[:host].length, rows.map { |r| r[:host].length }.max || 0].max,
+    port: [headers[:port].length, rows.map { |r| r[:port].length }.max || 0].max,
+    tls: [headers[:tls].length, rows.map { |r| r[:tls].length }.max || 0].max,
+    main: [headers[:main].length, rows.map { |r| r[:main].length }.max || 0].max
+  }
+
+  header = format(
+    "%-#{widths[:name]}s  %-#{widths[:host]}s  %-#{widths[:port]}s  %-#{widths[:tls]}s  %-#{widths[:main]}s",
+    headers[:name], headers[:host], headers[:port], headers[:tls], headers[:main]
+  )
+
+  entries = rows.map do |row|
+    label = format(
+      "%-#{widths[:name]}s  %-#{widths[:host]}s  %-#{widths[:port]}s  %-#{widths[:tls]}s  %-#{widths[:main]}s",
+      row[:name], row[:host], row[:port], row[:tls], row[:main]
+    )
+    { label: label, type: :file, name: row[:name] }
+  end
+
+  [header, entries]
+end
+
+def config_for(path)
+  @config_cache ||= {}
+  return @config_cache[path] if @config_cache.key?(path)
+
+  @config_cache[path] = Deploy::DSL.load(path)
+rescue StandardError
+  @config_cache[path] = nil
+end
+
+def servers_roots
+  dirs = Dir.glob(File.join(CONFIG_DIR, "servers*")).select do |path|
+    next false unless File.directory?(path)
+
+    base = File.basename(path)
+    base == "servers" || base.start_with?("servers.")
+  end
+  dirs.sort_by { |path| File.basename(path) }
+end
+
+def rel_path(path)
+  prefix = "#{CONFIG_DIR}/"
+  path.start_with?(prefix) ? path.delete_prefix(prefix) : path
+end
+
+def run_menu
+  roots = servers_roots
+  raise "No servers directories found in #{CONFIG_DIR}" if roots.empty?
+
+  current_root = nil
+  current_dir = nil
+  root_index = 0
+  indices = Hash.new(0)
+
+  loop do
+    if current_dir.nil?
+      display = roots.map { |path| "#{File.basename(path)}/" }
+      picked, root_index = select_from(
+        "Select servers directory:",
+        display,
+        index: root_index,
+        header: "  folder",
+        click_actions: Array.new(display.size, true)
+      )
+      return if picked == :quit || picked == :back
+      current_root = roots[display.index(picked)]
+      current_dir = current_root
+      next
+    end
+
+    entries = [{ label: "..", type: :up }]
+    dirs = Dir.children(current_dir).select { |name| File.directory?(File.join(current_dir, name)) }.sort
+    files = Dir.children(current_dir).select do |name|
+      name.end_with?(".rb") && File.file?(File.join(current_dir, name))
+    end.sort
+
+    entries += dirs.map { |name| { label: "#{name}/", type: :dir, name: name } }
+    header_text = nil
+    if files.any?
+      first_header = dirs.any? ? "folder/config" : "config"
+      header, server_rows = server_entries(current_dir, files, first_header: first_header)
+      entries += server_rows
+      header_text = "  #{header}"
+    elsif dirs.any?
+      header_text = "  folder"
+    end
+
+    menu_items = entries.map { |e| e[:label] }
+    click_actions = entries.map { |e| e[:type] != :file }
+    picked_label, index = select_from(
+      "Browse #{rel_path(current_dir)}:",
+      menu_items,
+      index: indices[current_dir],
+      header: header_text,
+      click_actions: click_actions
+    )
+    indices[current_dir] = index
+    return if picked_label == :quit
+    picked_label = ".." if picked_label == :back
+    picked = entries.find { |e| e[:label] == picked_label }
+    if picked[:type] == :up
+      if current_dir == current_root
+        current_dir = nil
+        current_root = nil
+      else
+        current_dir = File.dirname(current_dir)
+      end
+      next
+    end
+
+    if picked[:type] == :dir
+      current_dir = File.join(current_dir, picked[:name])
+      next
+    end
+
+    run_deploy(current_dir, picked[:name])
+  end
+end
+
+def deploy_cmd
+  raise "Deploy binary not found: #{DEPLOY_BIN}" unless File.exist?(DEPLOY_BIN)
+
+  if File.executable?(DEPLOY_BIN)
+    [DEPLOY_BIN]
+  else
+    [RbConfig.ruby, DEPLOY_BIN]
+  end
+end
+
+def run_deploy(dir_path, server)
+  loop do
+    cmd = deploy_cmd + ["--servers-dir", dir_path, "--server", server]
+    cmd << "--debug" if deploy_debug?
+    puts "Running: #{cmd.join(' ')}"
+    print "Proceed? [y/N], d=toggle debug (#{deploy_debug? ? 'on' : 'off'}): "
+    answer = read_line&.strip&.downcase
+    if answer == "d" || answer == "debug"
+      toggle_deploy_debug!
+      next
+    end
+    return unless answer == "y" || answer == "yes"
+
+    system(*cmd)
+    wait_for_keypress
+    break
+  end
+end
+
+def wait_for_keypress
+  return unless console_tty?
+
+  print "Press any key to continue..."
+  read_char
+  puts
+end
+
+init_deploy_debug_from_env!
+parse_menu_options!(ARGV)
+run_menu

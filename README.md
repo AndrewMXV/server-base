@@ -38,6 +38,12 @@ Run:
 ruby bin/deploy --server demo
 ```
 
+Or use the interactive server picker:
+
+```sh
+ruby bin/deploy-menu
+```
+
 The deploy CLI loads `config/servers/demo.rb`, resolves action dependencies,
 runs remote checks, and applies only the actions that are not already satisfied.
 
