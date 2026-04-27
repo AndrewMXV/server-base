@@ -16,7 +16,7 @@ module Deploy
 
   ServerConfig = Struct.new(
     :name, :host, :host_port, :tls_domain, :main_domain, :scheme,
-    :installs, :rsyncs, :env, :ssh_proxy, :ssh_proxy_url, :ssh_proxy_exclude_hosts,
+    :installs, :rsyncs, :configs, :env, :ssh_proxy, :ssh_proxy_url, :ssh_proxy_exclude_hosts,
     keyword_init: true
   )
 
@@ -138,6 +138,7 @@ module Deploy
       @attrs = {
         installs: [],
         rsyncs: [],
+        configs: [],
         env: {},
         host_port: 22,
         ssh_proxy: false,
@@ -169,6 +170,14 @@ module Deploy
       raise "rsync source is required in server #{@name}" if source.empty?
       raise "rsync target is required in server #{@name}" if target.empty?
       @attrs[:rsyncs] << { source: source, target: target }
+    end
+
+    def env(**vars)
+      @attrs[:env].merge!(vars.transform_keys { |k| k.to_s })
+    end
+
+    def config(target:, file_content:)
+      @attrs[:configs] << { target: target.to_s, file_content: file_content.to_s }
     end
 
     def to_config
@@ -310,13 +319,16 @@ module Deploy
     attr_reader :config, :ssh, :distro
     attr_accessor :params, :current_action_dir
 
-    def initialize(config, ssh, distro)
+    def initialize(config, ssh, distro, destroy: false)
       @config = config
       @ssh = ssh
       @distro = distro
       @params = {}
       @current_action_dir = nil
+      @destroy = destroy
     end
+
+    def destroying? = @destroy
 
     def remote(script)
       @ssh.script!(script)
@@ -349,14 +361,12 @@ module Deploy
     end
 
     def deploy_drs(drs_files, env = {})
-      env_builder = EnvBuilder.new(
-        config: @config,
-        params_env: @params[:env],
-        call_env: env
-      )
       drs_paths = Array(drs_files).map { |drs| Pathname.new(File.join(@current_action_dir, drs)) }
       drs_paths.each { |p| raise "DRS not found: #{p}" unless p.file? }
 
+      return destroy_drs_stacks(drs_paths) if @destroy
+
+      env_builder = EnvBuilder.new(config: @config, params_env: @params[:env], call_env: env)
       cmd = ['dry-stack', 'swarm_deploy', '-x', "ssh://root@#{@config.host}:#{@config.host_port}"]
       cmd << "--tls-domain=#{@config.tls_domain}" if @config.tls_domain
       cmd << '--'
@@ -379,6 +389,31 @@ module Deploy
         status = wait_thr.value
       end
       raise("Failed to deploy #{drs_paths.join(', ')}") unless status&.success?
+    end
+
+    private
+
+    def destroy_drs_stacks(drs_paths)
+      stack_names = drs_paths.filter_map { |p| extract_stack_name(File.read(p)) }.uniq
+      raise "Could not determine stack name(s) from: #{drs_paths.map(&:basename).join(', ')}" if stack_names.empty?
+
+      stack_names.each do |name|
+        puts ColorHelpers.colorize(:yellow, "[destroy] removing stack: #{name}")
+        @ssh.script!(<<~SH)
+          set -e
+          if docker stack ls --format '{{.Name}}' | grep -qx #{Shellwords.escape(name)}; then
+            docker stack rm #{Shellwords.escape(name)}
+            echo "Stack #{name} removed."
+          else
+            echo "Stack #{name} not found, skipping."
+          fi
+        SH
+      end
+    end
+
+    def extract_stack_name(content)
+      match = content.match(/^\s*Options\s+.*\bname:\s*['"]([^'"]+)['"]/)
+      match&.[](1)
     end
   end
 
@@ -416,8 +451,9 @@ module Deploy
   class Executor
     MAX_TIME_DRIFT_SECONDS = 30
 
-    def initialize(config, actions:)
+    def initialize(config, actions:, destroy: false)
       @config = config
+      @destroy = destroy
       @ssh = SSH.new(
         host: config.host,
         port: config.host_port,
@@ -433,10 +469,13 @@ module Deploy
       raise "tls_domain or main_domain is required" unless @config.tls_domain || @config.main_domain
 
       preflight = preflight!
-      run_rsyncs!
+      unless @destroy
+        run_rsyncs!
+        run_configs!
+      end
 
       distro = preflight[:distro]
-      context = ActionContext.new(@config, @ssh, distro)
+      context = ActionContext.new(@config, @ssh, distro, destroy: @destroy)
 
       install_steps = @config.installs
       params_by_name = install_steps.each_with_object({}) { |s, h| h[s[:name].to_sym] = s[:opts] || {} }
@@ -509,6 +548,17 @@ module Deploy
 
     def run_rsyncs!
       Array(@config.rsyncs).each { |entry| @ssh.rsync!(source: entry[:source], target: entry[:target]) }
+    end
+
+    def run_configs!
+      require 'tempfile'
+      Array(@config.configs).each do |entry|
+        Tempfile.create('deploy_config') do |tmp|
+          tmp.write(entry[:file_content])
+          tmp.flush
+          @ssh.rsync!(source: tmp.path, target: entry[:target])
+        end
+      end
     end
 
     def run_action(context, action, params)
@@ -625,13 +675,15 @@ module Deploy
       options = {
         servers_dir: File.expand_path("../config/servers", __dir__),
         actions_dir: File.expand_path("../actions", __dir__),
-        debug: Deploy.debug?
+        debug: Deploy.debug?,
+        destroy: false
       }
       parser = OptionParser.new do |opts|
         opts.banner = "Usage: deploy --server NAME [options]"
         opts.on("--server NAME", "Server DSL filename (without .rb)") { |v| options[:server] = v }
         opts.on("--servers-dir PATH", "Directory with server DSL files") { |v| options[:servers_dir] = v }
         opts.on("--actions-dir PATH", "Directory with action definitions") { |v| options[:actions_dir] = v }
+        opts.on("--destroy", "Destroy deployed stacks instead of deploying") { options[:destroy] = true }
         opts.on("--debug", "Enable debug output") { options[:debug] = true }
       end
       parser.parse!(argv)
@@ -645,7 +697,7 @@ module Deploy
       Actions::Loader.new(options[:actions_dir], registry).load_all
 
       config = DSL.load(server_file)
-      Executor.new(config, actions: registry).run!
+      Executor.new(config, actions: registry, destroy: options[:destroy]).run!
     end
   end
 end

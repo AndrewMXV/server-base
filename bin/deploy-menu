@@ -409,8 +409,14 @@ def deploy_cmd
 end
 
 def run_deploy(dir_path, server)
+  action, = select_from("Select action for #{server}:", ["deploy", "destroy"], index: 0)
+  return if action == :quit || action == :back
+
+  destroy = action == "destroy"
+
   loop do
     cmd = deploy_cmd + ["--servers-dir", dir_path, "--server", server]
+    cmd << "--destroy" if destroy
     cmd << "--debug" if deploy_debug?
     puts "Running: #{cmd.join(' ')}"
     print "Proceed? [y/N], d=toggle debug (#{deploy_debug? ? 'on' : 'off'}): "

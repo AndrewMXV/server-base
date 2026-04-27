@@ -6,11 +6,9 @@ Deploy traefik: { placement: { constraints: ['node.role == manager'] } }
 
 Options name: 'simple-ingress', traefik: true, traefik_tls: !!ENV['TLS_DOMAIN'], tls_domain: ENV['TLS_DOMAIN']
 
-basic_auth = ENV.fetch('TRAEFIK_BASIC_AUTH', 'admin:admin:demo')
-
 Ingress traefik: [
-                  { path: '/traefik', port: '8080', basic_auth: basic_auth },
-                  { host: 'traefik.*', port: '8080', basic_auth: basic_auth }
+                  { path: '/traefik', port: '8080', oauth_provider: 'oauth2_oauth2_slim:7000/auth' },
+                  { host: 'traefik.*', port: '8080', oauth_provider: 'oauth2_oauth2_slim:7000/auth' }
                  ]
 
 http_port = ENV.fetch('TRAEFIK_HTTP_PORT', 80)

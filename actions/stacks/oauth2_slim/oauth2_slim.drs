@@ -17,4 +17,9 @@ Service :oauth2_slim, image: 'dtorry/oauth2-slim:latest', ports: 7000 do
       CONSOLE_LEVEL: ENV.fetch('CONSOLE_LEVEL', 'all')
 
   volume name: 'oauth2-slim', target: '/private_keys'
+
+  if ENV['USERS_YAML'].to_s != ''
+    env USERS_YAML: ENV['USERS_YAML']
+    volume "#{ENV['USERS_YAML']}:#{ENV['USERS_YAML']}:ro"
+  end
 end
