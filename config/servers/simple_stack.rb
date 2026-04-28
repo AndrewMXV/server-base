@@ -8,6 +8,7 @@ Server :simple_stack do
   install :insight
   install :grafana
   install :registry_listener
+  install :registry
 
   env AUTH_BOT: 'eksli_auth_bot'
   env AUTH_VERIFY_KEY: '<change_me>'

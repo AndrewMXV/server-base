@@ -1,0 +1,25 @@
+Description "Docker Registry"
+Labels 'stack.product': 'registry'
+
+Options name: 'registry', traefik: true, traefik_tls: !!ENV['TLS_DOMAIN'], tls_domain: ENV['TLS_DOMAIN']
+
+Deploy registry: { placement: { constraints: ['node.role == manager'] } }
+
+Ingress registry: [{ host: 'registry.*' }]
+
+Service :registry, image: 'registry:2', ports: 5000 do
+  network :default
+  network :grafana_network, name: 'grafana-network', external: true
+
+  volume target: '/var/lib/registry', name: 'registry_data'
+
+  env REGISTRY_HTTP_ADDR: '0.0.0.0:5000'
+  env REGISTRY_AUTH: 'htpasswd'
+  env REGISTRY_AUTH_HTPASSWD_REALM: 'Private Registry'
+  env REGISTRY_AUTH_HTPASSWD_PATH: '/auth/htpasswd'
+
+  config target: '/auth/htpasswd', file_content: ENV.fetch('REGISTRY_HTPASSWD', '')
+end
+
+Volume :registry_data, name: 'registry_data'
+Network :grafana_network, external: true, name: 'grafana-network'
