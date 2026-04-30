@@ -1,5 +1,5 @@
 Server :simple_stack do
-  host '<change_ip>'
+  host 'host'
   tls_domain '<change_domain>'
 
   install :swarm
